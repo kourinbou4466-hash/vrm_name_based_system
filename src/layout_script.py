@@ -1,90 +1,82 @@
 # ==============================================================================
-# VRM-NX VNS (VRM Name-based System) レイアウト制御スクリプト
-# 参照設計書: Train Control by Name機能定義書 Ver. 1.0
-# スクリプトバージョン: Ver. 1.0.2 (連動ポイント解放制御修正版)
+# VRM-NX VNS (VRM Name-based System) レイアウト制御スクリプト Ver. 1.2.0
+# 参照設計書: Train Control by Name詳細設計書 Ver. 1.2 / 機能設計書 Ver. 1.2
 # ==============================================================================
 
 import vrmapi
 import re
 
-# --- グローバル状態管理 ---
-TRAIN_SMOOTH_MAP = {}          # { train_id: {'target': float, 'current': float, 'step': float} }
-BLOCK_OCCUPY_MAP = {}          # { block_name: [train_id, ...] }
-BLOCK_WAIT_QUEUE = {}          # { block_name: [train_id, ...] }
-TRAIN_CURRENT_BLOCKS = {}      # { train_id: [block_name, ...] }
-TRAIN_ALLOW_ONCE_BLOCK = {}    # { train_id: True }
+# ==============================================================================
+# 【グローバル変数の設計】
+# ==============================================================================
 
-# 進路構成用管理
-POINT_RESERVE_MAP = {}         # { point_name: train_id }
-TRAIN_OCCUPIED_POINTS = {}     # { train_id: [point_name, ...] }
-ROUTE_WAIT_QUEUE = []          # [ {'train_id': int, 'sensor_option': str}, ... ]
-TRAIN_BACKUP_ROUTES = {}       # { train_id: [backup_sensor_option, ...] } ※後勝ち優先のためリスト先頭に追加
+# 1. 閉塞・進路構成の排他制御（コアデータ）
+TRAIN_TO_BLOCK = {}        # { train_id: ["進路構成-...", "閉塞-...", ...] }
+BLOCK_TO_TRAIN = {}        # { block_name: [train_id, ...] }
+POINT_TO_TRAIN = {}        # { point_name: [train_id, ...] }
 
-# ポイント連動管理（目的閉塞進入完了時に解放するため）
-BLOCK_PENDING_POINTS = {}      # { (train_id, block_name): [point_name, ...] }
+# 2. 進路待ち・予備進路管理
+ROUTE_WAIT_QUEUE = []      # [ {'train_id': int, 'route_option': str}, ... ]
+TRAIN_BACKUP_ROUTES = {}   # { train_id: [backup_route_option, ...] }
 
-# 連結待機管理: { active_tcn_name: [残りのコマンドリスト] }
-PENDING_COUPLE_COMMANDS = {}
+# 3. タイマー・非同期制御（集中タイマー方式）
+SYSTEM_TIMER_ID = 100
+SYSTEM_TIMER_INTERVAL = 0.2  # タイマー更新周期（秒）
+TRAIN_SMOOTH_MAP = {}      # { train_id: {'target': float, 'current': float, 'step': float} }
+TRAIN_COMMAND_QUEUE = {}   # { train_id: [ command_dict, ... ] }
 
-NEXT_TIMER_ID = 1000
-TIMER_ACTION_MAP = {}
+# 4. 連結待機管理
+PENDING_COUPLE_COMMANDS = {} # { train_id: [残りのコマンドリスト] }
 
-# ----------------------------------------------------
-# 0. ログ出力 & 信号機制御ヘルパー
-# ----------------------------------------------------
+# 5. システム起動時に1回だけ取得するレイアウト要素リスト
+SIGNAL_LIST = []
+POINT_LIST = []
 
-def get_train_display_name(train_obj):
+# 内部フラグ（起動コマンド等による1回限定無条件進入許可）
+TRAIN_ALLOW_ONCE_BLOCK = {} # { train_id: True }
+
+
+# ==============================================================================
+# 第5階層：ユーティリティ
+# ==============================================================================
+
+def get_train_info(train_obj):
+    """対象列車オブジェクトの属性（ID、TCN名、表示名、両数、速度など）をまとめた辞書を返す"""
     if not train_obj:
-        return "UNKNOWN"
+        return {'id': 0, 'data_name': 'UNKNOWN', 'tcn_name': 'UNKNOWN', 'type': '', 'origin': '', 'dest': '', 'display_name': 'UNKNOWN'}
+
     data_name = str(train_obj.GetNAME())
     tcn_name = train_obj.GetStatusDataString("tcn_name")
     if not tcn_name:
         tcn_name = data_name
-    return f"【データ名: '{data_name}' | tcn_name: '{tcn_name}'】"
 
-def update_block_signals(layout, block_name, is_occupied):
-    sig_list = []
-    layout.ListSignal(sig_list)
-    
-    target_stat = 1 if is_occupied else 6
-    color_label = "赤(停止)" if is_occupied else "青(進行)"
+    parts = tcn_name.split('-')
+    train_type = parts[0] if len(parts) >= 1 else ""
+    st1 = parts[1] if len(parts) >= 2 else ""
+    st2 = parts[2] if len(parts) >= 3 else ""
 
-    for sig in sig_list:
-        sig_name = str(sig.GetNAME())
-        if block_name in sig_name:
-            sig.SetStat(0, target_stat)
-            vrmapi.LOG(f"  -> [信号制御] 信号機『{sig_name}』(閉塞:『{block_name}』) を {color_label} (Stat:{target_stat}) に変更しました")
+    rev = train_obj.GetStatusDataInt("reverse")
+    if rev == 1:
+        origin, dest = st2, st1
+    else:
+        origin, dest = st1, st2
 
-# ----------------------------------------------------
-# 1. パース & ユーティリティ関数
-# ----------------------------------------------------
+    display_name = f"【データ名: '{data_name}' | tcn_name: '{tcn_name}'】"
 
-def cancel_train_timers(train_id):
-    if train_id in TRAIN_SMOOTH_MAP:
-        del TRAIN_SMOOTH_MAP[train_id]
-        
-    to_delete = [t_id for t_id, info in TIMER_ACTION_MAP.items() if info.get('train_id') == train_id]
-    for t_id in to_delete:
-        del TIMER_ACTION_MAP[t_id]
+    return {
+        'id': train_obj.GetID(),
+        'data_name': data_name,
+        'tcn_name': tcn_name,
+        'type': train_type,
+        'origin': origin,
+        'dest': dest,
+        'parts': parts,
+        'display_name': display_name
+    }
 
-def parse_sensor_name(sensor_name):
-    filter_dict = None
-    rest = sensor_name
-
-    match_filter = re.match(r'^\((種別|始発|終着|始終着)=([^)]+)\)(.*)$', sensor_name)
-    if match_filter:
-        f_type = match_filter.group(1)
-        f_conds = match_filter.group(2).split('|')
-        filter_dict = {'type': f_type, 'conds': f_conds}
-        rest = match_filter.group(3)
-
-    func_parts = rest.split('-', 1)
-    func_type = func_parts[0]
-    func_option = func_parts[1] if len(func_parts) > 1 else ""
-
-    return filter_dict, func_type, func_option
 
 def is_filter_matched(filter_dict, train_info):
+    """通過した列車情報が、センサーに設定されたフィルタ条件に一致するか判定して返す"""
     if not filter_dict:
         return True
 
@@ -107,687 +99,636 @@ def is_filter_matched(filter_dict, train_info):
                 return True
     return False
 
-def get_train_info(train_obj):
-    tcn_name = train_obj.GetStatusDataString("tcn_name")
-    if not tcn_name:
-        tcn_name = str(train_obj.GetNAME())
-
-    parts = tcn_name.split('-')
-    train_type = parts[0] if len(parts) >= 1 else ""
-    st1 = parts[1] if len(parts) >= 2 else ""
-    st2 = parts[2] if len(parts) >= 3 else ""
-
-    rev = train_obj.GetStatusDataInt("reverse")
-    if rev == 1:
-        origin, dest = st2, st1
-    else:
-        origin, dest = st1, st2
-
-    return {
-        'id': train_obj.GetID(),
-        'data_name': str(train_obj.GetNAME()),
-        'tcn_name': tcn_name,
-        'type': train_type,
-        'origin': origin,
-        'dest': dest,
-        'parts': parts
-    }
-
-# ----------------------------------------------------
-# 2. 変速 & タイマー制御・コマンドチェーン実行
-# ----------------------------------------------------
-
-def set_train_voltage_smooth(layout, train_id, target_voltage, duration_sec=0.0):
-    global NEXT_TIMER_ID
-    train = layout.GetTrain(train_id)
-    if not train:
-        return
-
-    current_voltage = train.GetVoltage()
+def clear_train_smooth_task(train_id):
+    """該当列車の変速タスク（TRAIN_SMOOTH_MAP）をクリアして自動加減速を強制停止する"""
     if train_id in TRAIN_SMOOTH_MAP:
-        current_voltage = TRAIN_SMOOTH_MAP[train_id]['current']
+        del TRAIN_SMOOTH_MAP[train_id]
 
-    if duration_sec <= 0 or abs(current_voltage - target_voltage) < 0.01:
-        train.SetVoltage(target_voltage)
-        if train_id in TRAIN_SMOOTH_MAP:
-            del TRAIN_SMOOTH_MAP[train_id]
-        return
-
-    interval = 0.2
-    steps = max(1, int(duration_sec / interval))
-    step_val = (target_voltage - current_voltage) / steps
-
-    NEXT_TIMER_ID += 1
-    timer_id = NEXT_TIMER_ID
-
-    TRAIN_SMOOTH_MAP[train_id] = {
-        'target': target_voltage,
-        'current': current_voltage,
-        'step': step_val
-    }
-
-    TIMER_ACTION_MAP[timer_id] = {
-        'train_id': train_id,
-        'action': 'smooth_step'
-    }
-    layout.SetEventTimer(interval, timer_id)
-
-def execute_command_chain(layout, train_obj, commands):
-    global NEXT_TIMER_ID
-    if not commands:
-        return
-
-    cmd = commands[0]
-    rem_cmds = commands[1:]
+def stop_train_immediately(train_obj):
+    """変速タスクをクリアした上で即座に電圧を0にする"""
     train_id = train_obj.GetID()
-    disp_name = get_train_display_name(train_obj)
-
-    if cmd.startswith("変速"):
-        m = re.search(r'変速(?:(\d+)%)?(?:(\d+)秒)?', cmd)
-        speed = float(m.group(1)) / 100.0 if m and m.group(1) else 1.0
-        dur = float(m.group(2)) if m and m.group(2) else 0.0
-        
-        vrmapi.LOG(f"  -> [コマンド実行] {disp_name}: 変速 {speed*100:.0f}% ({dur}秒)")
-        set_train_voltage_smooth(layout, train_id, speed, dur)
-        if rem_cmds:
-            NEXT_TIMER_ID += 1
-            t_id = NEXT_TIMER_ID
-            TIMER_ACTION_MAP[t_id] = {'train_id': train_id, 'action': 'chain', 'cmds': rem_cmds}
-            layout.SetEventTimer(dur if dur > 0 else 0.1, t_id)
-
-    elif cmd == "連結":
-        tcn_name = train_obj.GetStatusDataString("tcn_name") or str(train_obj.GetNAME())
-        PENDING_COUPLE_COMMANDS[tcn_name] = rem_cmds
-        vrmapi.LOG(f"  -> [コマンド待機] {disp_name}: 編成イベントからの連結通知(couple)を待機します...")
-
-    elif cmd.startswith("停止"):
-        m = re.search(r'停止(?:(\d+)秒)?', cmd)
-        cancel_train_timers(train_id)
-        train_obj.SetVoltage(0.0)
-
-        if m and m.group(1):
-            sec = float(m.group(1))
-            vrmapi.LOG(f"  -> [コマンド実行] {disp_name}: 停止 ({sec}秒間)")
-            if rem_cmds:
-                NEXT_TIMER_ID += 1
-                t_id = NEXT_TIMER_ID
-                TIMER_ACTION_MAP[t_id] = {
-                    'train_id': train_id, 
-                    'action': 'chain', 
-                    'cmds': rem_cmds
-                }
-                layout.SetEventTimer(sec, t_id)
-        else:
-            vrmapi.LOG(f"  -> [コマンド実行] {disp_name}: 無期限停止")
-
-    elif cmd == "反転":
-        train_obj.Turn()
-        vrmapi.LOG(f"  -> [コマンド実行] {disp_name}: 向きを反転 (Turn)")
-        execute_command_chain(layout, train_obj, rem_cmds)
-
-    elif cmd == "折返":
-        train_obj.Turn()
-        current_rev = train_obj.GetStatusDataInt("reverse")
-        new_rev = 0 if current_rev == 1 else 1
-        train_obj.SetStatusDataInt("reverse", new_rev)
-        vrmapi.LOG(f"  -> [コマンド実行] {disp_name}: 折返 (reverseステータス: {new_rev})")
-        execute_command_chain(layout, train_obj, rem_cmds)
-
-    elif cmd.startswith("分割先頭") or cmd.startswith("分割最後尾"):
-        is_head = cmd.startswith("分割先頭")
-        new_tcn_name = cmd.replace("分割先頭", "").replace("分割最後尾", "")
-
-        car_list = train_obj.GetCarList()
-        total_cars = len(car_list) if car_list else 0
-
-        if total_cars < 2:
-            vrmapi.LOG(f"  -> [解結エラー] 1両編成のため解結できません (両数: {total_cars})")
-            return
-
-        split_index = 1 if is_head else (total_cars - 1)
-        mode_str = "分割先頭" if is_head else "分割最後尾"
-        vrmapi.LOG(f"  -> [解結準備] {disp_name} の解結({mode_str})を開始します (全{total_cars}両 / 位置: {split_index}両目, 新名称: '{new_tcn_name}')")
-
-        new_train_id = train_obj.SplitTrain(split_index)
-
-        if new_train_id and new_train_id > 0:
-            new_train = layout.GetTrain(new_train_id)
-            orig_tcn = train_obj.GetStatusDataString("tcn_name")
-
-            if is_head:
-                if new_train:
-                    new_train.SetStatusDataString("tcn_name", orig_tcn)
-                    new_train.SetVoltage(0.0)
-
-                cancel_train_timers(train_id)
-                train_obj.SetStatusDataString("tcn_name", new_tcn_name)
-
-                moving_train = train_obj
-                stay_train = new_train
-            else:
-                cancel_train_timers(train_id)
-                train_obj.SetStatusDataString("tcn_name", orig_tcn)
-                train_obj.SetVoltage(0.0)
-
-                if new_train:
-                    new_train.SetStatusDataString("tcn_name", new_tcn_name)
-
-                moving_train = new_train
-                stay_train = train_obj
-
-            if train_id in TRAIN_CURRENT_BLOCKS:
-                for bname in TRAIN_CURRENT_BLOCKS[train_id]:
-                    if bname in BLOCK_OCCUPY_MAP and new_train_id not in BLOCK_OCCUPY_MAP[bname]:
-                        BLOCK_OCCUPY_MAP[bname].append(new_train_id)
-                    if new_train_id not in TRAIN_CURRENT_BLOCKS:
-                        TRAIN_CURRENT_BLOCKS[new_train_id] = []
-                    TRAIN_CURRENT_BLOCKS[new_train_id].append(bname)
-
-            vrmapi.LOG(f"  -> [解結完了] 解結成功！")
-            vrmapi.LOG(f"     ・停留側: {get_train_display_name(stay_train) if stay_train else 'N/A'}")
-            vrmapi.LOG(f"     ・分離側(発車): {get_train_display_name(moving_train) if moving_train else 'N/A'}")
-
-            if moving_train:
-                execute_command_chain(layout, moving_train, rem_cmds)
-        else:
-            vrmapi.LOG(f"  -> [解結エラー] SplitTrain({split_index}) に失敗しました。")
-
-    elif cmd.startswith("起動"):
-        is_turn = cmd.startswith("起動反転")
-        prefix = "起動反転" if is_turn else "起動"
-        
-        m = re.search(rf'{prefix}(?:(\d+)%)?([^?]*)(?:\?\(([^)]+)\))?', cmd)
-        speed = float(m.group(1)) / 100.0 if m and m.group(1) else 1.0
-        target_blocks_str = m.group(2) if m else ""
-        cond_block = m.group(3) if m else None
-
-        target_blocks = [b.strip() for b in target_blocks_str.split('|') if b.strip()]
-
-        if cond_block:
-            occupying = BLOCK_OCCUPY_MAP.get(cond_block, [])
-            if len(occupying) == 0:
-                vrmapi.LOG(f"  -> [{prefix}スキップ] 条件閉塞『{cond_block}』に列車が存在しないため起動処理をスキップしました")
-                execute_command_chain(layout, train_obj, rem_cmds)
-                return
-
-        cmd_label = "起動反転" if is_turn else "起動"
-        vrmapi.LOG(f"  -> [{cmd_label}コマンド] 閉塞リスト {target_blocks} からの起動を試みます (指定速度: {speed*100:.0f}%)")
-
-        for bname in target_blocks:
-            if bname in BLOCK_OCCUPY_MAP and len(BLOCK_OCCUPY_MAP[bname]) > 0:
-                target_train_id = BLOCK_OCCUPY_MAP[bname][0]
-                target_train = layout.GetTrain(target_train_id)
-                if target_train:
-                    TRAIN_ALLOW_ONCE_BLOCK[target_train_id] = True
-                    target_disp = get_train_display_name(target_train)
-                    
-                    if is_turn:
-                        target_train.Turn()
-                        vrmapi.LOG(f"     ・閉塞区間『{bname}』内の列車 {target_disp} の向きを反転(Turn)しました。")
-
-                    vrmapi.LOG(f"     ・閉塞区間『{bname}』内の列車 {target_disp} を起動しました。(1回限定の閉塞進入許可を付与)")
-                    set_train_voltage_smooth(layout, target_train_id, speed, 1.0)
-                    break
-        execute_command_chain(layout, train_obj, rem_cmds)
-
-# ----------------------------------------------------
-# 3. 進路構成制御コア
-# ----------------------------------------------------
-
-def register_backup_route(train_id, sensor_option):
-    """予備進路を列車IDに登録する（後に登録されたものが優先されるよう先頭に挿入）"""
-    if train_id not in TRAIN_BACKUP_ROUTES:
-        TRAIN_BACKUP_ROUTES[train_id] = []
-    TRAIN_BACKUP_ROUTES[train_id].insert(0, sensor_option)
-
-def try_single_route_setting(layout, train_obj, sensor_option):
-    """単一の進路構成オプションの試行（成功時 True、不成立時 False）"""
-    train_id = train_obj.GetID()
-
-    parts = [p.strip() for p in sensor_option.split('>') if p.strip()]
-    if not parts:
-        return True
-
-    target_block = parts[-1]
-    point_cmds = parts[:-1]
-
-    pt_list = []
-    layout.ListPoint(pt_list)
-    parsed_pt_cmds = []
-
-    for pt_cmd in point_cmds:
-        direction = 1 if pt_cmd.startswith("分岐") else 0
-        pt_name_sub = pt_cmd.replace("分岐", "").replace("直進", "")
-
-        matched_pts = [pt for pt in pt_list if str(pt.GetNAME()) == pt_name_sub]
-        
-        if not matched_pts:
-            matched_pts = [pt for pt in pt_list if pt_name_sub in str(pt.GetNAME())]
-
-        for pt in matched_pts:
-            p_full_name = str(pt.GetNAME())
-            reserver = POINT_RESERVE_MAP.get(p_full_name)
-            if reserver is not None and reserver != train_id:
-                vrmapi.LOG(f"  -> [進路試行不可] ポイント『{p_full_name}』は他列車(ID:{reserver})が予約中")
-                return False
-            
-            if not any(p[1] == p_full_name for p in parsed_pt_cmds):
-                parsed_pt_cmds.append((pt, p_full_name, direction))
-
-    occupying_trains = BLOCK_OCCUPY_MAP.get(target_block, [])
-    other_trains = [tid for tid in occupying_trains if tid != train_id]
-    if len(other_trains) > 0:
-        vrmapi.LOG(f"  -> [進路試行不可] 目的閉塞『{target_block}』は使用中")
-        return False
-
-    disp_name = get_train_display_name(train_obj)
-    vrmapi.LOG(f"  -> [進路構成成功] {disp_name} の進路を確保・構成します (選択進路: '{sensor_option}')")
-
-    if train_id not in TRAIN_OCCUPIED_POINTS:
-        TRAIN_OCCUPIED_POINTS[train_id] = []
-
-    reserved_point_names = []
-
-    # --- ポイントの切替と予約 ---
-    for pt, p_full_name, direction in parsed_pt_cmds:
-        pt.SetBranch(direction)
-        POINT_RESERVE_MAP[p_full_name] = train_id
-        if p_full_name not in TRAIN_OCCUPIED_POINTS[train_id]:
-            TRAIN_OCCUPIED_POINTS[train_id].append(p_full_name)
-        reserved_point_names.append(p_full_name)
-        
-        dir_label = "分岐(1)" if direction == 1 else "直進(0)"
-        vrmapi.LOG(f"     ・ポイント『{p_full_name}』を {dir_label} に切替・予約完了")
-
-    # 目的閉塞へ進入完了時に解放するためにポイントリストを記録
-    if reserved_point_names:
-        BLOCK_PENDING_POINTS[(train_id, target_block)] = reserved_point_names
-
-    # --- 進入先閉塞の予約と信号更新 ---
-    if target_block not in BLOCK_OCCUPY_MAP:
-        BLOCK_OCCUPY_MAP[target_block] = []
-    if train_id not in BLOCK_OCCUPY_MAP[target_block]:
-        BLOCK_OCCUPY_MAP[target_block].append(train_id)
-
-    if train_id not in TRAIN_CURRENT_BLOCKS:
-        TRAIN_CURRENT_BLOCKS[train_id] = []
-    if target_block not in TRAIN_CURRENT_BLOCKS[train_id]:
-        TRAIN_CURRENT_BLOCKS[train_id].append(target_block)
-
-    update_block_signals(layout, target_block, is_occupied=True)
-    vrmapi.LOG(f"     ・進入先閉塞『{target_block}』の予約・占有を完了しました")
-
-    global ROUTE_WAIT_QUEUE
-    ROUTE_WAIT_QUEUE = [q for q in ROUTE_WAIT_QUEUE if q['train_id'] != train_id]
-
-    if train_obj.GetVoltage() < 0.01:
-        vrmapi.LOG(f"  -> [進路発車] 停止中の列車 {disp_name} を再発車させます")
-        set_train_voltage_smooth(layout, train_id, 1.0, 2.0)
-
-    return True
-
-def handle_route_setting(layout, train_obj, primary_sensor_option):
-    """本進路および登録された予備進路（後勝ち優先）を順に試行する"""
-    train_id = train_obj.GetID()
-    disp_name = get_train_display_name(train_obj)
-
-    candidates = [primary_sensor_option]
-    if train_id in TRAIN_BACKUP_ROUTES:
-        candidates.extend(TRAIN_BACKUP_ROUTES[train_id])
-
-    for option in candidates:
-        vrmapi.LOG(f"  -> [進路確保試行] {disp_name}: 候補進路『{option}』を判定中...")
-        if try_single_route_setting(layout, train_obj, option):
-            if train_id in TRAIN_BACKUP_ROUTES:
-                del TRAIN_BACKUP_ROUTES[train_id]
-                vrmapi.LOG(f"  -> [予備進路消去] {disp_name} の登録済み予備進路をクリアしました")
-            return True
-
-    # 全進路が不可の場合
-    vrmapi.LOG(f"  -> [進路構成失敗] {disp_name}: 本進路および予備進路のすべてが使用不可でした")
-    _fail_route(layout, train_obj, primary_sensor_option)
-    return False
-
-def handle_route_release(layout, train_obj, sensor_option):
-    """
-    進路構成センサーを最後尾車輪が通過した際の処理。
-    ※ 閉塞の解放処理はすべて「閉塞センサー（最後尾車輪）」に一任するため、
-       ここでは重複解放を防ぐためにログ出力または予備進路のクリア補助のみを行います。
-    """
-    train_id = train_obj.GetID()
-    disp_name = get_train_display_name(train_obj)
     
-    # 閉塞解放は閉塞センサー側で安全に行うため、ここでの BLOCK_OCCUPY_MAP 操作は削除します。
-    # 必要に応じてログ出力のみ残します。
-    vrmapi.LOG(f"  -> [進路センサー離脱] 列車 {disp_name} (最後尾車輪) が 進路構成センサー『{sensor_option}』を通過しました")
+    # 1. 自動センサー等による変速補間タスクを消去
+    clear_train_smooth_task(train_id)
     
-    retry_route_and_block_waiters(layout)
-
-def _fail_route(layout, train_obj, sensor_option):
-    train_id = train_obj.GetID()
-    disp_name = get_train_display_name(train_obj)
-
-    cancel_train_timers(train_id)
+    # 2. 電圧を0（停止）に設定
     train_obj.SetVoltage(0.0)
 
-    if not any(q['train_id'] == train_id for q in ROUTE_WAIT_QUEUE):
-        ROUTE_WAIT_QUEUE.append({'train_id': train_id, 'sensor_option': sensor_option})
-    
-    vrmapi.LOG(f"  -> [進路構成待機] 列車 {disp_name} を直ちに停止させ、進路開放を待機します")
+def _update_block_signals(layout, block_name, is_occupied):
+    """信号制御ヘルパー（閉塞の状態に合わせて信号機の色を変更）"""
+    target_stat = 1 if is_occupied else 6
+    color_label = "赤(停止)" if is_occupied else "青(進行)"
 
-def release_train_points(layout, train_id, specific_points=None):
-    """列車が予約していたポイントを解放する"""
-    if train_id in TRAIN_OCCUPIED_POINTS:
-        train = layout.GetTrain(train_id)
-        disp_name = get_train_display_name(train) if train else f"ID:{train_id}"
-        
-        pts_to_release = specific_points if specific_points is not None else list(TRAIN_OCCUPIED_POINTS[train_id])
-        
-        for pt_name in pts_to_release:
-            if POINT_RESERVE_MAP.get(pt_name) == train_id:
-                del POINT_RESERVE_MAP[pt_name]
-                vrmapi.LOG(f"  -> [ポイント解放] 列車 {disp_name} によるポイント『{pt_name}』の予約を解放しました")
-            if pt_name in TRAIN_OCCUPIED_POINTS[train_id]:
-                TRAIN_OCCUPIED_POINTS[train_id].remove(pt_name)
+    for sig in SIGNAL_LIST:
+        sig_name = str(sig.GetNAME())
+        if block_name in sig_name:
+            sig.SetStat(0, target_stat)
+            vrmapi.LOG(f"  -> [信号制御] 信号機『{sig_name}』(閉塞:『{block_name}』) を {color_label} (Stat:{target_stat}) に変更しました")
 
-def retry_route_and_block_waiters(layout):
+
+# ==============================================================================
+# 第3階層：閉塞・進路の状態管理・排他制御 (route_)
+# ==============================================================================
+
+def route_can_enter(layout, train_id, target_option, is_route_setting=False):
+    """
+    指定された閉塞や進路構成に列車が進入可能か（空き状態・ポイント排他）を検証・チェックする。
+    [読み出しのみ可能]
+    """
+    train_obj = layout.GetTrain(train_id)
+    t_info = get_train_info(train_obj)
+    t_name = t_info['data_name']
+    tcn = t_info['tcn_name']
+
+    can_enter = True
+    blocking_train_str = ""
+
+    if not is_route_setting:
+        # 単純閉塞の進入可否チェック
+        occupying = BLOCK_TO_TRAIN.get(target_option, [])
+        other_trains = [tid for tid in occupying if tid != train_id]
+        if len(other_trains) > 0:
+            can_enter = False
+            b_info = get_train_info(layout.GetTrain(other_trains[0]))
+            blocking_train_str = f" [ブロック列車: 列車名={b_info['data_name']}, tcn_name={b_info['tcn_name']}]"
+    else:
+        # 進路構成のチェック（すべてのポイントおよび目的閉塞）
+        parts = [p.strip() for p in target_option.split('>') if p.strip()]
+        if parts:
+            target_block = parts[-1]
+            point_cmds = parts[:-1]
+
+            # 1. ポイントの予約状態チェック（グローバル POINT_LIST を使用）
+            for pt_cmd in point_cmds:
+                pt_name_sub = pt_cmd.replace("分岐", "").replace("直進", "")
+                matched_pts = [pt for pt in POINT_LIST if pt_name_sub in str(pt.GetNAME())]
+
+                for pt in matched_pts:
+                    p_full_name = str(pt.GetNAME())
+                    reservers = POINT_TO_TRAIN.get(p_full_name, [])
+                    other_reservers = [tid for tid in reservers if tid != train_id]
+                    if len(other_reservers) > 0:
+                        can_enter = False
+                        b_info = get_train_info(layout.GetTrain(other_reservers[0]))
+                        blocking_train_str = f" [ブロック列車(ポイント): 列車名={b_info['data_name']}, tcn_name={b_info['tcn_name']}]"
+                        break
+                if not can_enter:
+                    break
+
+            # 2. 目的閉塞の占有状態チェック（ポイント側でブロックされていなければ判定）
+            if can_enter:
+                occupying = BLOCK_TO_TRAIN.get(target_block, [])
+                other_trains = [tid for tid in occupying if tid != train_id]
+                if len(other_trains) > 0:
+                    can_enter = False
+                    b_info = get_train_info(layout.GetTrain(other_trains[0]))
+                    blocking_train_str = f" [ブロック列車(閉塞): 列車名={b_info['data_name']}, tcn_name={b_info['tcn_name']}]"
+
+    # [ログ出力仕様準拠]
+    vrmapi.LOG(f"[route_can_enter] 列車名={t_name}, tcn_name={tcn}, 対象={target_option}, 可否={can_enter}{blocking_train_str}")
+    return can_enter
+
+
+def route_enter(layout, train_id, target_option, is_route_setting=False):
+    """
+    進入可能と判断された閉塞・進路をロックして列車を進入させる。
+    [読み書き可能]
+    """
+    if not is_route_setting:
+        # 単純閉塞進入
+        block_name = target_option
+        if train_id not in TRAIN_TO_BLOCK:
+            TRAIN_TO_BLOCK[train_id] = []
+        if block_name not in TRAIN_TO_BLOCK[train_id]:
+            TRAIN_TO_BLOCK[train_id].append(block_name)
+
+        if block_name not in BLOCK_TO_TRAIN:
+            BLOCK_TO_TRAIN[block_name] = []
+        if train_id not in BLOCK_TO_TRAIN[block_name]:
+            BLOCK_TO_TRAIN[block_name].append(train_id)
+
+        _update_block_signals(layout, block_name, is_occupied=True)
+
+    else:
+        # 進路構成進入
+        parts = [p.strip() for p in target_option.split('>') if p.strip()]
+        if not parts:
+            return
+
+        target_block = parts[-1]
+        point_cmds = parts[:-1]
+
+        # TRAIN_TO_BLOCK の先頭に登録
+        route_key = f"進路構成-{target_option}"
+        if train_id not in TRAIN_TO_BLOCK:
+            TRAIN_TO_BLOCK[train_id] = []
+        TRAIN_TO_BLOCK[train_id].append(route_key)
+
+        # ポイント切り替えおよび POINT_TO_TRAIN 登録（グローバル POINT_LIST を使用）
+        for pt_cmd in point_cmds:
+            direction = 1 if pt_cmd.startswith("分岐") else 0
+            pt_name_sub = pt_cmd.replace("分岐", "").replace("直進", "")
+            matched_pts = [pt for pt in POINT_LIST if pt_name_sub in str(pt.GetNAME())]
+
+            for pt in matched_pts:
+                p_full_name = str(pt.GetNAME())
+                pt.SetBranch(direction)
+
+                if p_full_name not in POINT_TO_TRAIN:
+                    POINT_TO_TRAIN[p_full_name] = []
+                if train_id not in POINT_TO_TRAIN[p_full_name]:
+                    POINT_TO_TRAIN[p_full_name].append(train_id)
+
+        # 目的閉塞の登録
+        if target_block not in TRAIN_TO_BLOCK[train_id]:
+            TRAIN_TO_BLOCK[train_id].append(target_block)
+
+        if target_block not in BLOCK_TO_TRAIN:
+            BLOCK_TO_TRAIN[target_block] = []
+        if train_id not in BLOCK_TO_TRAIN[target_block]:
+            BLOCK_TO_TRAIN[target_block].append(train_id)
+
+        # 予備進路があれば消去
+        if train_id in TRAIN_BACKUP_ROUTES:
+            del TRAIN_BACKUP_ROUTES[train_id]
+
+        _update_block_signals(layout, target_block, is_occupied=True)
+
+
+def route_leave(layout, train_id, target_name, is_route_setting=False):
+    """
+    閉塞や進路をアンロックして開放する。
+    [読み書き可能]
+    仕様に従い1行のログを出力する。
+    """
+    train_obj = layout.GetTrain(train_id)
+    t_info = get_train_info(train_obj)
+    t_name = t_info['data_name']
+    tcn = t_info['tcn_name']
+
+    history = TRAIN_TO_BLOCK.get(train_id, [])
+    released_blocks = []
+    released_points = []
+
+    if not is_route_setting:
+        # 閉塞最後尾通過時：当該閉塞より後ろの要素を削除・解放
+        if target_name in history:
+            idx = history.index(target_name)
+            to_remove = history[:idx]
+            TRAIN_TO_BLOCK[train_id] = history[idx:]
+
+            for item in to_remove:
+                if item.startswith("進路構成-"):
+                    # ポイント開放
+                    opts = item.replace("進路構成-", "").split('>')
+                    for pt_cmd in opts[:-1]:
+                        pt_name_sub = pt_cmd.replace("分岐", "").replace("直進", "")
+                        for p_name in list(POINT_TO_TRAIN.keys()):
+                            if pt_name_sub in p_name and train_id in POINT_TO_TRAIN[p_name]:
+                                POINT_TO_TRAIN[p_name].remove(train_id)
+                                if not POINT_TO_TRAIN[p_name]:
+                                    del POINT_TO_TRAIN[p_name]
+                                released_points.append(p_name)
+                else:
+                    # 閉塞開放
+                    if item in BLOCK_TO_TRAIN and train_id in BLOCK_TO_TRAIN[item]:
+                        BLOCK_TO_TRAIN[item].remove(train_id)
+                        if not BLOCK_TO_TRAIN[item]:
+                            del BLOCK_TO_TRAIN[item]
+                            _update_block_signals(layout, item, is_occupied=False)
+                        released_blocks.append(item)
+
+    # [ログ出力仕様準拠] 実際に開放された閉塞・ポイントをログ出力
+    released_str = f"閉塞={released_blocks if released_blocks else None}, ポイント={released_points if released_points else None}"
+    vrmapi.LOG(f"[route_leave] 列車名={t_name}, tcn_name={tcn}, 解放={released_str}")
+
+    # 開放された閉塞・ポイントに基づいて再試行
+    if released_blocks or released_points:
+        route_retry(layout)
+
+def route_retry(layout):
+    """
+    ポイントや閉塞が開放されたタイミングで呼び出され、ブロックされていた列車の進行・進路構成を試みる。
+    [読み書き可能]
+    """
     global ROUTE_WAIT_QUEUE
     for wait_info in list(ROUTE_WAIT_QUEUE):
         t_id = wait_info['train_id']
-        s_opt = wait_info['sensor_option']
+        r_opt = wait_info['route_option']
         tr = layout.GetTrain(t_id)
-        if tr:
-            handle_route_setting(layout, tr, s_opt)
 
-# ----------------------------------------------------
-# 4. 編成スクリプトからの連結イベント受取関数
-# ----------------------------------------------------
+        if tr and route_can_enter(layout, t_id, r_opt, is_route_setting=True):
+            ROUTE_WAIT_QUEUE = [q for q in ROUTE_WAIT_QUEUE if q['train_id'] != t_id]
+            route_enter(layout, t_id, r_opt, is_route_setting=True)
+            
+            # 発車・再加速
+            train_info = get_train_info(tr)
+            vrmapi.LOG(f"  -> [進路再開] 待機中だった列車 {train_info['display_name']} の進路を構成し発車させます")
+            TRAIN_SMOOTH_MAP[t_id] = {'target': 1.0, 'current': tr.GetVoltage(), 'step': 0.1}
 
-def on_train_couple_event(merged_train_obj, param):
+def route_manage_by_coupling(master_id, target_id):
+    """
+    連結発生時に、消滅編成ID(target_id)のデータ・キューを
+    存続編成ID(master_id)へ引き継ぎ・クリーンアップして再始動する。
+    """
     layout = vrmapi.LAYOUT()
-    merged_id = merged_train_obj.GetID()
-    disp_name = get_train_display_name(merged_train_obj)
+    vrmapi.LOG(f"[連結情報整理] 存続ID:{master_id} / 消滅ID:{target_id} の情報整理・引き継ぎを開始します")
 
-    vrmapi.LOG(f"[連結イベント受信] 編成より連結(couple)が通知されました")
-    vrmapi.LOG(f"   統合後編成: {disp_name} (ID: {merged_id})")
-
-    target_blocks = [bname for bname, t_ids in BLOCK_OCCUPY_MAP.items() if merged_id in t_ids]
-
-    for block_name in target_blocks:
-        BLOCK_OCCUPY_MAP[block_name] = [merged_id]
-        vrmapi.LOG(f"  -> [閉塞統合] 閉塞区間『{block_name}』の占有列車IDを 統合後ID:{merged_id} に更新しました")
-
-    TRAIN_CURRENT_BLOCKS[merged_id] = list(target_blocks)
-
-    for block_name, t_ids in list(BLOCK_OCCUPY_MAP.items()):
-        if block_name not in target_blocks:
-            new_t_ids = [tid for tid in t_ids if tid != merged_id]
-            if new_t_ids:
-                BLOCK_OCCUPY_MAP[block_name] = new_t_ids
-            else:
-                del BLOCK_OCCUPY_MAP[block_name]
-                update_block_signals(layout, block_name, is_occupied=False)
-
-    obsolete_ids = [tid for tid in list(TRAIN_CURRENT_BLOCKS.keys()) if tid != merged_id and tid not in [t.GetID() for t in layout.GetTrainList() if t]]
-    for old_id in obsolete_ids:
-        del TRAIN_CURRENT_BLOCKS[old_id]
-
-    if not PENDING_COUPLE_COMMANDS:
-        vrmapi.LOG("  -> [通知無視] 連結待機中のコマンドが存在しません")
-        return
-
-    _, rem_cmds = PENDING_COUPLE_COMMANDS.popitem()
-    vrmapi.LOG(f"  -> [コマンド再開] {disp_name} の残コマンドを実行します: {rem_cmds}")
-
-    execute_command_chain(layout, merged_train_obj, rem_cmds)
-
-# ----------------------------------------------------
-# 5. 閉塞制御コア & イベントハンドラ
-# ----------------------------------------------------
-
-def handle_block_entry(layout, train_obj, target_block_name, tire_type):
-    """
-    閉塞センサー通過時の処理
-    tire_type: 1 = 先頭車輪（進入判定・FIFOリスト末尾追加）
-               2 = 最後尾車輪（指定閉塞より前の旧閉塞のみ解放・連動ポイント解放）
-    """
-    train_id = train_obj.GetID()
-    disp_name = get_train_display_name(train_obj)
+    # 1. TRAIN_TO_BLOCK に登録されている閉塞のみを対象に BLOCK_TO_TRAIN 内の target_id を master_id に置換
+    target_blocks = TRAIN_TO_BLOCK.get(target_id, [])
+    master_blocks = TRAIN_TO_BLOCK.get(master_id, [])
     
-    if train_id not in TRAIN_CURRENT_BLOCKS:
-        TRAIN_CURRENT_BLOCKS[train_id] = []
+    for bname in set(target_blocks + master_blocks):
+        if bname in BLOCK_TO_TRAIN:
+            BLOCK_TO_TRAIN[bname] = list(dict.fromkeys([master_id if tid == target_id else tid for tid in BLOCK_TO_TRAIN[bname]]))
 
-    # ==========================================
-    # 1. 先頭車輪の通過（閉塞進入・FIFOリスト末尾追加）
-    # ==========================================
-    if tire_type == 1:
-        if not target_block_name or target_block_name in ["なし", "解除"]:
-            return
+    # POINT_TO_TRAIN 内の target_id も必要に応じて置換
+    for pname, t_list in POINT_TO_TRAIN.items():
+        if target_id in t_list:
+            POINT_TO_TRAIN[pname] = list(dict.fromkeys([master_id if tid == target_id else tid for tid in t_list]))
 
-        if target_block_name in TRAIN_CURRENT_BLOCKS[train_id]:
-            return
+    # 2. TRAIN_TO_BLOCK の統合
+    t_blocks = TRAIN_TO_BLOCK.pop(target_id, [])
+    m_blocks = TRAIN_TO_BLOCK.setdefault(master_id, [])
+    for b in t_blocks:
+        if b not in m_blocks:
+            m_blocks.append(b)
 
-        occupying_trains = BLOCK_OCCUPY_MAP.get(target_block_name, [])
-        other_trains = [tid for tid in occupying_trains if tid != train_id]
-        
-        allow_once = TRAIN_ALLOW_ONCE_BLOCK.pop(train_id, False)
+    # 3. 予備進路の削除
+    TRAIN_BACKUP_ROUTES.pop(target_id, None)
 
-        if len(other_trains) > 0 and not allow_once:
-            cancel_train_timers(train_id)
-            train_obj.SetVoltage(0.0)
-            
-            if target_block_name not in BLOCK_WAIT_QUEUE:
-                BLOCK_WAIT_QUEUE[target_block_name] = []
-            if train_id not in BLOCK_WAIT_QUEUE[target_block_name]:
-                BLOCK_WAIT_QUEUE[target_block_name].append(train_id)
+    # 4. ROUTE_WAIT_QUEUE の統合とログ出力
+    global ROUTE_WAIT_QUEUE
+    updated_queue = []
+    transferred_count = 0
 
-            vrmapi.LOG(f"  -> [閉塞:進入不可] 閉塞区間『{target_block_name}』は使用中のため、列車 {disp_name} は直ちに停止・待機します")
+    for q in ROUTE_WAIT_QUEUE:
+        if isinstance(q, dict) and q.get('train_id') in (master_id, target_id):
+            q['train_id'] = master_id
+            if not any(item.get('train_id') == master_id and item.get('route_option') == q.get('route_option') for item in updated_queue):
+                updated_queue.append(q)
+                transferred_count += 1
         else:
-            if allow_once:
-                vrmapi.LOG(f"  -> [閉塞特例進入] 起動特例パスにより、列車 {disp_name} が占有中の閉塞区間『{target_block_name}』へ進入許可されました")
+            updated_queue.append(q)
 
-            if target_block_name not in BLOCK_OCCUPY_MAP:
-                BLOCK_OCCUPY_MAP[target_block_name] = []
-            if train_id not in BLOCK_OCCUPY_MAP[target_block_name]:
-                BLOCK_OCCUPY_MAP[target_block_name].append(train_id)
-            
-            TRAIN_CURRENT_BLOCKS[train_id].append(target_block_name)
-            vrmapi.LOG(f"  -> [閉塞進入] 列車 {disp_name} (先頭車輪) が 閉塞区間『{target_block_name}』に進入 (現在滞留閉塞: {TRAIN_CURRENT_BLOCKS[train_id]})")
+    ROUTE_WAIT_QUEUE = updated_queue
+    vrmapi.LOG(f"[連結情報整理] ROUTE_WAIT_QUEUE 統合完了: 存続ID:{master_id} (引き継ぎ/保持数: {transferred_count}件, キュー全件数: {len(ROUTE_WAIT_QUEUE)}件)")
 
-            update_block_signals(layout, target_block_name, is_occupied=True)
+    # 5. PENDING_COUPLE_COMMANDS から target_id または master_id の連結保留コマンドを統合
+    pending_cmds = PENDING_COUPLE_COMMANDS.pop(target_id, []) or PENDING_COUPLE_COMMANDS.pop(master_id, [])
+    if pending_cmds:
+        cmd_dicts = [{'cmd': c} for c in pending_cmds]
+        TRAIN_COMMAND_QUEUE[master_id] = cmd_dicts
+        vrmapi.LOG(f"[連結情報整理] 連結保留コマンドを存続ID:{master_id} に引き継ぎました: {pending_cmds}")
+    elif master_id not in TRAIN_COMMAND_QUEUE or not TRAIN_COMMAND_QUEUE[master_id]:
+        # 残りコマンドがない場合はデフォルト起動（前進加速）
+        TRAIN_COMMAND_QUEUE[master_id] = [{'cmd': '変速100%2秒'}]
+        vrmapi.LOG(f"[連結情報整理] 残存コマンドなしのため、存続ID:{master_id} にデフォルト起動コマンドを設定しました")
 
-# ==========================================
-    # 2. 最後尾車輪の通過（自身より前の旧閉塞解放 & 連動ポイント解放）
-    # ==========================================
-    elif tire_type == 2:
-        current_blocks = TRAIN_CURRENT_BLOCKS.get(train_id, [])
+    # 6. 変速タスクをクリアして再起動トリガーを発行
+    clear_train_smooth_task(master_id)
+    route_retry(layout)
 
-        # パス1: 進入完了した指定閉塞（target_block_name）に紐づくポイントの解放
-        pending_key = (train_id, target_block_name)
-        if pending_key in BLOCK_PENDING_POINTS:
-            pts_to_release = BLOCK_PENDING_POINTS.pop(pending_key)
-            release_train_points(layout, train_id, pts_to_release)
+# ==============================================================================
+# 第4階層：タイマー・非同期実行制御 (execute_)
+# ==============================================================================
 
-        # パス2: 通過完了した旧閉塞の開放処理
-        if target_block_name in current_blocks:
-            idx = current_blocks.index(target_block_name)
-            blocks_to_release = current_blocks[:idx]
-            TRAIN_CURRENT_BLOCKS[train_id] = current_blocks[idx:]
+def execute_speed_control(layout):
+    """列車の速度（電圧）を時間経過に合わせて滑らかに変化させる"""
+    for train_id, data in list(TRAIN_SMOOTH_MAP.items()):
+        train = layout.GetTrain(train_id)
+        if not train:
+            del TRAIN_SMOOTH_MAP[train_id]
+            continue
 
-            for old_block in blocks_to_release:
-                if old_block in BLOCK_OCCUPY_MAP and train_id in BLOCK_OCCUPY_MAP[old_block]:
-                    BLOCK_OCCUPY_MAP[old_block].remove(train_id)
-                    if len(BLOCK_OCCUPY_MAP[old_block]) == 0:
-                        del BLOCK_OCCUPY_MAP[old_block]
-                        update_block_signals(layout, old_block, is_occupied=False)
+        new_voltage = data['current'] + data['step']
+        target = data['target']
 
-                    vrmapi.LOG(f"  -> [閉塞解放] 列車 {disp_name} (最後尾車輪) が 閉塞区間『{old_block}』を完全に離脱・開放")
+        is_complete = False
+        if data['step'] >= 0 and new_voltage >= target:
+            new_voltage = target
+            is_complete = True
+        elif data['step'] < 0 and new_voltage <= target:
+            new_voltage = target
+            is_complete = True
 
-                if old_block in BLOCK_WAIT_QUEUE and len(BLOCK_WAIT_QUEUE[old_block]) > 0:
-                    waiting_train_id = BLOCK_WAIT_QUEUE[old_block].pop(0)
-                    waiting_train = layout.GetTrain(waiting_train_id)
-                    if waiting_train:
-                        if old_block not in BLOCK_OCCUPY_MAP:
-                            BLOCK_OCCUPY_MAP[old_block] = []
-                        BLOCK_OCCUPY_MAP[old_block].append(waiting_train_id)
-                        
-                        if waiting_train_id not in TRAIN_CURRENT_BLOCKS:
-                            TRAIN_CURRENT_BLOCKS[waiting_train_id] = []
-                        TRAIN_CURRENT_BLOCKS[waiting_train_id].append(old_block)
+        train.SetVoltage(new_voltage)
+        data['current'] = new_voltage
 
-                        w_disp = get_train_display_name(waiting_train)
-                        vrmapi.LOG(f"  -> [閉塞再開] 待機中の列車 {w_disp} が 閉塞区間『{old_block}』へ進入発車")
-                        
-                        update_block_signals(layout, old_block, is_occupied=True)
-                        set_train_voltage_smooth(layout, waiting_train_id, 1.0, 3.0)
+        if is_complete:
+            del TRAIN_SMOOTH_MAP[train_id]
 
-        retry_route_and_block_waiters(layout)
+def execute_train_command(layout):
+    """時系列で登録された列車制御コマンド群を順次実行する"""
+    for train_id, cmd_list in list(TRAIN_COMMAND_QUEUE.items()):
+        if not cmd_list:
+            del TRAIN_COMMAND_QUEUE[train_id]
+            continue
+
+        train_obj = layout.GetTrain(train_id)
+        if not train_obj:
+            del TRAIN_COMMAND_QUEUE[train_id]
+            continue
+
+        # 【重要】変速処理（自動加減速・補間タスク）が実行中の場合は、
+        # すべての列車制御コマンド（停止、反転、折返、分割、連結等）の実行を待機する
+        if train_id in TRAIN_SMOOTH_MAP:
+            continue
+
+        # 先頭コマンドを参照（停止カウント中の場合は pop しない）
+        cmd_info = cmd_list[0]
+        cmd = cmd_info.get('cmd', '')
+
+        if cmd.startswith("変速"):
+            cmd_list.pop(0)
+            m = re.search(r'変速(?:(\d+)%)?(?:(\d+)秒)?', cmd)
+            speed = float(m.group(1)) / 100.0 if m and m.group(1) else 1.0
+            dur = float(m.group(2)) if m and m.group(2) else 0.0
+
+            step_val = (speed - train_obj.GetVoltage()) / max(1, int(dur / SYSTEM_TIMER_INTERVAL)) if dur > 0 else (speed - train_obj.GetVoltage())
+            TRAIN_SMOOTH_MAP[train_id] = {'target': speed, 'current': train_obj.GetVoltage(), 'step': step_val}
+
+        elif cmd.startswith("停止"):
+            # 初回実行時に停止秒数を解析してカウントダウン用カウンターを設定
+            if 'wait_time' not in cmd_info:
+                m = re.search(r'停止(?:(\d+)秒)?', cmd)
+                stop_sec = float(m.group(1)) if m and m.group(1) else 0.0
+                cmd_info['wait_time'] = stop_sec
+                
+                # 電圧を完全に0に設定
+                train_obj.SetVoltage(0.0)
+
+            # 0.2秒周期タイマーでカウントダウン
+            cmd_info['wait_time'] -= SYSTEM_TIMER_INTERVAL
+
+            # 待機時間が完了したらキューから削除して次のコマンドへ進める
+            if cmd_info['wait_time'] <= 0:
+                cmd_list.pop(0)
+                
+        elif cmd == "反転":
+            cmd_list.pop(0)
+            train_obj.Turn()
+
+        elif cmd == "折返":
+            cmd_list.pop(0)
+            train_obj.Turn()
+            cur_rev = train_obj.GetStatusDataInt("reverse")
+            train_obj.SetStatusDataInt("reverse", 0 if cur_rev == 1 else 1)
+
+        elif cmd.startswith("分割先頭") or cmd.startswith("分割最後尾"):
+            cmd_list.pop(0)
+            is_head = cmd.startswith("分割先頭")
+            new_tcn = cmd.replace("分割先頭", "").replace("分割最後尾", "")
+            car_list = train_obj.GetCarList()
+            if car_list and len(car_list) >= 2:
+                split_idx = 1 if is_head else len(car_list) - 1
+                new_id = train_obj.SplitTrain(split_idx)
+                if new_id and new_id > 0:
+                    new_tr = layout.GetTrain(new_id)
+                    orig_tcn = train_obj.GetStatusDataString("tcn_name")
+                    if is_head:
+                        if new_tr: new_tr.SetStatusDataString("tcn_name", orig_tcn)
+                        train_obj.SetStatusDataString("tcn_name", new_tcn)
+                    else:
+                        train_obj.SetStatusDataString("tcn_name", orig_tcn)
+                        if new_tr: new_tr.SetStatusDataString("tcn_name", new_tcn)
+
+        elif cmd == "連結":
+            cmd_list.pop(0)
+            # 「連結」コマンド実行以降に残っているコマンド群を train_id をキーとして格納
+            PENDING_COUPLE_COMMANDS[train_id] = [c.get('cmd') for c in cmd_list]
+            TRAIN_COMMAND_QUEUE[train_id] = [] # 連結完了まで旧編成のコマンド実行を中断
+
+        elif cmd.startswith("起動"):
+            cmd_list.pop(0)
+            is_turn = cmd.startswith("起動反転")
+            prefix = "起動反転" if is_turn else "起動"
+            m = re.search(rf'{prefix}(?:(\d+)%)?([^?]*)(?:\?\(([^)]+)\))?', cmd)
+            speed = float(m.group(1)) / 100.0 if m and m.group(1) else 1.0
+            target_blocks = [b.strip() for b in (m.group(2) if m else "").split('|') if b.strip()]
+
+            for bname in target_blocks:
+                occupying_ids = BLOCK_TO_TRAIN.get(bname, [])
+                if occupying_ids:
+                    target_tr_id = occupying_ids[0]
+                    target_tr = layout.GetTrain(target_tr_id)
+                    if target_tr:
+                        TRAIN_ALLOW_ONCE_BLOCK[target_tr_id] = True
+                        if is_turn: target_tr.Turn()
+                        TRAIN_SMOOTH_MAP[target_tr_id] = {'target': speed, 'current': 0.0, 'step': 0.1}
+                        break
+
+# ==============================================================================
+# 第2階層：センサー通過時制御 (pass_)
+# ==============================================================================
+
+def pass_train_control(layout, train_obj, train_id, train_info, func_option):
+    """
+    列車制御（変速や停止待ちなど）のセンサーを通過した際の処理。
+    仕様に従い1行のログを出力する。
+    """
+    t_name = train_info['data_name']
+    tcn = train_info['tcn_name']
+
+    cmds = func_option.split('>')
+    cmd_dicts = [{'cmd': c} for c in cmds]
+    TRAIN_COMMAND_QUEUE[train_id] = cmd_dicts
+
+    # [ログ出力仕様準拠]
+    vrmapi.LOG(f"[pass_train_control] 列車名={t_name}, tcn_name={tcn}, コマンド={func_option}")
+
+
+def pass_switch_control(layout, train_obj, train_id, train_info, func_type, location_name, matched):
+    """
+    ポイント操作のセンサーを通過した際の処理。
+    仕様に従い1行のログを出力する。
+    """
+    t_name = train_info['data_name']
+    tcn = train_info['tcn_name']
+
+    for pt in POINT_LIST:
+        pt_name = str(pt.GetNAME())
+        if location_name in pt_name:
+            if func_type == "ポイント直進" and matched:
+                pt.SetBranch(0)
+            elif func_type == "ポイント分岐" and matched:
+                pt.SetBranch(1)
+            elif func_type == "ポイント制御":
+                pt.SetBranch(1 if matched else 0)
+
+    # [ログ出力仕様準拠]
+    vrmapi.LOG(f"[pass_switch_control] 列車名={t_name}, tcn_name={tcn}, ポイント名={location_name}, マッチ={matched}")
+
+
+def pass_block_head(layout, train_obj, train_id, train_info, block_name):
+    """列車先頭が閉塞境界センサーを通過した際の処理"""
+    allow_once = TRAIN_ALLOW_ONCE_BLOCK.pop(train_id, False)
+
+    if route_can_enter(layout, train_id, block_name, is_route_setting=False) or allow_once:
+        route_enter(layout, train_id, block_name, is_route_setting=False)
+    else:
+        # 進入不可のため緊急停止・待機キューへ登録
+        clear_train_smooth_task(train_id)
+        train_obj.SetVoltage(0.0)
+
+        if not any(q['train_id'] == train_id for q in ROUTE_WAIT_QUEUE):
+            ROUTE_WAIT_QUEUE.append({
+                'train_id': train_id,
+                'route_option': block_name,
+                'is_route_setting': False  # 単純閉塞フラグ
+            })
+
+def pass_block_tail(layout, train_obj, train_id, train_info, block_name):
+    """列車最後尾が閉塞境界センサーを通過（閉塞を完全に進出）した際の処理"""
+    route_leave(layout, train_id, block_name, is_route_setting=False)
+
+def pass_route_setting_head(layout, train_obj, train_id, train_info, route_option):
+    """列車先頭が進路構成センサーを通過した際の処理"""
+    candidates = [route_option]
+    if train_id in TRAIN_BACKUP_ROUTES:
+        candidates.extend(TRAIN_BACKUP_ROUTES[train_id])
+
+    # 構成可能か判定
+    selected_option = None
+    for opt in candidates:
+        if route_can_enter(layout, train_id, opt, is_route_setting=True):
+            selected_option = opt
+            break
+
+    if selected_option:
+        route_enter(layout, train_id, selected_option, is_route_setting=True)
+    else:
+        # 変速タスクをクリアして強制停止
+        clear_train_smooth_task(train_id)
+        train_obj.SetVoltage(0.0)
+
+        if not any(q['train_id'] == train_id for q in ROUTE_WAIT_QUEUE):
+            ROUTE_WAIT_QUEUE.append({'train_id': train_id, 'route_option': route_option})
+
+def pass_route_setting_tail(layout, train_obj, train_id, train_info, route_option):
+    """列車最後尾が進路構成センサーを通過完了した際の処理"""
+    pass_block_tail(layout, train_obj, train_id, train_info, route_option)
+
+
+def pass_backup_route(layout, train_obj, train_id, train_info, route_option):
+    """本進路が塞がっていた場合に備え、予備進路を登録・通過処理する"""
+    if train_id not in TRAIN_BACKUP_ROUTES:
+        TRAIN_BACKUP_ROUTES[train_id] = []
+    # 後勝ち（後に登録されたものを優先）にするため先頭に挿入
+    TRAIN_BACKUP_ROUTES[train_id].insert(0, route_option)
+
+
+# ==============================================================================
+# 第1階層：VRMNXイベントエントリーポイント (on_ / 例外 vrmevent)
+# ==============================================================================
 
 def vrmevent(obj, ev, param):
+    """タイマー発生や各種システムイベントを受信するイベントエントリーポイント"""
     layout = vrmapi.LAYOUT()
 
     if ev == 'init':
-        vrmapi.LOG("[初期化] VNS 制御スクリプト(Ver. 1.0.2) を起動します...")
+        vrmapi.LOG("[初期化] VNS 制御スクリプト Ver. 2.0 (詳細設計書準拠) 起動")
 
-        pt_list = []
-        layout.ListPoint(pt_list)
-        vrmapi.LOG(f"[初期化] 検出ポイント数: {len(pt_list)}")
-
-        sig_list = []
-        layout.ListSignal(sig_list)
-        vrmapi.LOG(f"[初期化] 検出信号機数: {len(sig_list)}")
-        for sig in sig_list:
+        # 1. 信号機一覧を取得して初期化 (全青)
+        global SIGNAL_LIST
+        SIGNAL_LIST = []
+        layout.ListSignal(SIGNAL_LIST)
+        for sig in SIGNAL_LIST:
             sig.SetStat(0, 6)
 
+        # 2. ポイント一覧を取得してグローバル変数へ保存
+        global POINT_LIST
+        POINT_LIST = []
+        layout.ListPoint(POINT_LIST)
+
+        # 3. 列車初期ステータス設定
         tr_list = []
         layout.ListTrain(tr_list)
-        vrmapi.LOG(f"[初期化] 検出列車数: {len(tr_list)}")
-        
         for tr in tr_list:
             tr.SetStatusDataInt("reverse", 0)
             data_name = str(tr.GetNAME())
             tr.SetStatusDataString("tcn_name", data_name)
 
-            disp = get_train_display_name(tr)
-            vrmapi.LOG(f"  -> 初期登録: {disp}")
-
-        vrmapi.LOG("[初期化] 完了")
+        # 4. 単一タイマー(SYSTEM_TIMER_ID=100)の開始 (0.2秒周期)
+        layout.SetEventTimer(SYSTEM_TIMER_INTERVAL, SYSTEM_TIMER_ID)
 
     elif ev == 'timer':
-        timer_id = None
-        if isinstance(param, dict):
-            timer_id = param.get('eventUID') or param.get('eventid') or param.get('id')
-        elif isinstance(param, int):
-            timer_id = param
-        else:
-            try:
-                timer_id = int(param)
-            except Exception:
-                pass
+        timer_id = param.get('eventUID') if isinstance(param, dict) else param
+        if timer_id == SYSTEM_TIMER_ID:
+            # タイマー駆動によるスムーズ変速およびコマンドの実行
+            execute_speed_control(layout)
+            execute_train_command(layout)
+            # ループタイマー再設定
+            layout.SetEventTimer(SYSTEM_TIMER_INTERVAL, SYSTEM_TIMER_ID)
 
-        if timer_id in TIMER_ACTION_MAP:
-            info = TIMER_ACTION_MAP.pop(timer_id)
-            train_id = info['train_id']
-            action = info['action']
-            train = layout.GetTrain(train_id)
-
-            if not train:
-                return
-
-            if action == 'smooth_step':
-                if train_id in TRAIN_SMOOTH_MAP:
-                    data = TRAIN_SMOOTH_MAP[train_id]
-                    new_voltage = data['current'] + data['step']
-                    target = data['target']
-
-                    is_complete = False
-                    if data['step'] > 0 and new_voltage >= target:
-                        new_voltage = target
-                        is_complete = True
-                    elif data['step'] < 0 and new_voltage <= target:
-                        new_voltage = target
-                        is_complete = True
-
-                    train.SetVoltage(new_voltage)
-                    data['current'] = new_voltage
-
-                    if not is_complete:
-                        global NEXT_TIMER_ID
-                        NEXT_TIMER_ID += 1
-                        next_id = NEXT_TIMER_ID
-                        TIMER_ACTION_MAP[next_id] = {'train_id': train_id, 'action': 'smooth_step'}
-                        layout.SetEventTimer(0.2, next_id)
-                    else:
-                        del TRAIN_SMOOTH_MAP[train_id]
-
-            elif action == 'chain':
-                execute_command_chain(layout, train, info['cmds'])
 
 def on_sensor_catch(sensor_obj, param):
+    """列車がセンサーを踏んだ際に呼び出される。センサー名のパース（文字列解析）もこの内部で完結して実行する"""
     sensor_dir = param.get('dir') if 'dir' in param else param.get('direction', None)
     if sensor_dir is not None and sensor_dir != 1:
         return
 
-    tire_type = param.get('tire', 1)
-
+    tire_type = param.get('tire', 1)  # 1: 先頭車輪, 2: 最後尾車輪
     layout = vrmapi.LAYOUT()
     train_id = param.get('trainid')
     train = layout.GetTrain(train_id)
     if not train:
         return
 
+    # 関数の引数統一のため一括取得
     train_info = get_train_info(train)
+    t_name = train_info['data_name']
+    tcn = train_info['tcn_name']
     sensor_name = str(sensor_obj.GetNAME())
+    vrmapi.LOG(f"[on_sensor_catch] 列車名={t_name}, tcn_name={tcn}, センサー名={sensor_name}, tire_type={tire_type}")
 
-    filter_dict, func_type, func_option = parse_sensor_name(sensor_name)
+    # --- センサー名のパース (内部完結) ---
+    filter_dict = None
+    rest = sensor_name
+    match_filter = re.match(r'^\((種別|始発|終着|始終着)=([^)]+)\)(.*)$', sensor_name)
+    if match_filter:
+        filter_dict = {'type': match_filter.group(1), 'conds': match_filter.group(2).split('|')}
+        rest = match_filter.group(3)
+
+    parts = rest.split('-', 1)
+    func_type = parts[0]
+    func_option = parts[1] if len(parts) > 1 else ""
+
     matched = is_filter_matched(filter_dict, train_info)
 
-    wheel_label = "先頭車輪" if tire_type == 1 else "最後尾車輪"
-    disp_name = get_train_display_name(train)
-    vrmapi.LOG(f"[自動センサー通過] データ名:『{sensor_name}』 ({wheel_label}) 通過列車: {disp_name} (FilterMatch: {matched})")
-
+    # --- センサー機能別のルーティング（統一引数渡し）---
     if tire_type == 1 and func_type in ["ポイント直進", "ポイント分岐", "ポイント制御"]:
-        location_name = func_option
-        pt_list = []
-        layout.ListPoint(pt_list)
-
-        for pt in pt_list:
-            pt_name = str(pt.GetNAME())
-            if location_name in pt_name:
-                if func_type == "ポイント直進":
-                    if matched:
-                        pt.SetBranch(0)
-                        vrmapi.LOG(f"  -> ポイント『{pt_name}』: 【直進(0)】切替")
-                elif func_type == "ポイント分岐":
-                    if matched:
-                        pt.SetBranch(1)
-                        vrmapi.LOG(f"  -> ポイント『{pt_name}』: 【分岐(1)】切替")
-                elif func_type == "ポイント制御":
-                    if matched:
-                        pt.SetBranch(1)
-                        vrmapi.LOG(f"  -> ポイント『{pt_name}』: Match -> 【分岐(1)】切替")
-                    else:
-                        pt.SetBranch(0)
-                        vrmapi.LOG(f"  -> ポイント『{pt_name}』: Unmatch -> 【直進(0)】切替")
+        pass_switch_control(layout, train, train_id, train_info, func_type, func_option, matched)
 
     elif tire_type == 1 and func_type == "列車制御":
-        if matched and func_option:
-            commands = func_option.split('>')
-            execute_command_chain(layout, train, commands)
+        if matched:
+            pass_train_control(layout, train, train_id, train_info, func_option)
 
-    elif func_type == "予備進路":
-        if matched and tire_type == 1:
-            register_backup_route(train_id, func_option)
-            vrmapi.LOG(f"  -> [予備進路登録] 列車 {disp_name} に予備進路『{func_option}』を登録しました")
+    elif tire_type == 1 and func_type == "予備進路":
+        if matched:
+            pass_backup_route(layout, train, train_id, train_info, func_option)
 
     elif func_type == "閉塞":
         if matched:
-            block_name = func_option
-            handle_block_entry(layout, train, block_name, tire_type)
+            if tire_type == 1:
+                pass_block_head(layout, train, train_id, train_info, func_option)
+            elif tire_type == 2:
+                pass_block_tail(layout, train, train_id, train_info, func_option)
 
     elif func_type == "進路構成":
         if matched:
             if tire_type == 1:
-                handle_route_setting(layout, train, func_option)
+                pass_route_setting_head(layout, train, train_id, train_info, func_option)
             elif tire_type == 2:
-                handle_route_release(layout, train, func_option)
+                pass_route_setting_tail(layout, train, train_id, train_info, func_option)
+
+def on_train_couple_event(survived_id, deleted_id):
+    """
+    連結イベントハンドラ
+    survived_id: 存続する編成ID
+    deleted_id : 統合されて空になった編成ID (delid)
+    """
+    vrmapi.LOG(f"[連結イベント] 存続ID: {survived_id}, 消滅ID(delid): {deleted_id}")
+    
+    # 消滅したID(deleted_id)が保持していた閉塞・ポイントのロック開放や master_id への移管処理
+    route_manage_by_coupling(master_id=survived_id, target_id=deleted_id)
