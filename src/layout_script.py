@@ -1,5 +1,5 @@
 # ==============================================================================
-# VRM-NX VNS (VRM Name-based System) レイアウト制御スクリプト Ver. 1.2.0
+# VRM-NX VNS (VRM Name-based System) レイアウト制御スクリプト Ver. 1.2.1
 # 参照設計書: Train Control by Name詳細設計書 Ver. 1.2 / 機能設計書 Ver. 1.2
 # ------------------------------------------------------------------------------
 # Created by kourinbou4466@gmail.com
@@ -279,33 +279,36 @@ def route_leave(layout, train_id, target_name, is_route_setting=False):
     released_blocks = []
     released_points = []
 
-    if not is_route_setting:
-        # 閉塞最後尾通過時：当該閉塞より後ろの要素を削除・解放
-        if target_name in history:
-            idx = history.index(target_name)
-            to_remove = history[:idx]
-            TRAIN_TO_BLOCK[train_id] = history[idx:]
+    # 閉塞最後尾通過時：当該閉塞より後ろの要素を削除・解放
+    if is_route_setting == True:
+        target_name = "進路構成-" + target_name
+    vrmapi.LOG(f"[route_leave] 列車名={t_name}, target_name={target_name}, history={history}")
+    if target_name in history:
+        idx = history.index(target_name)
+        to_remove = history[:idx]
+        TRAIN_TO_BLOCK[train_id] = history[idx:]
 
-            for item in to_remove:
-                if item.startswith("進路構成-"):
-                    # ポイント開放
-                    opts = item.replace("進路構成-", "").split('>')
-                    for pt_cmd in opts[:-1]:
-                        pt_name_sub = pt_cmd.replace("分岐", "").replace("直進", "")
-                        for p_name in list(POINT_TO_TRAIN.keys()):
-                            if pt_name_sub in p_name and train_id in POINT_TO_TRAIN[p_name]:
-                                POINT_TO_TRAIN[p_name].remove(train_id)
-                                if not POINT_TO_TRAIN[p_name]:
-                                    del POINT_TO_TRAIN[p_name]
-                                released_points.append(p_name)
-                else:
-                    # 閉塞開放
-                    if item in BLOCK_TO_TRAIN and train_id in BLOCK_TO_TRAIN[item]:
-                        BLOCK_TO_TRAIN[item].remove(train_id)
-                        if not BLOCK_TO_TRAIN[item]:
-                            del BLOCK_TO_TRAIN[item]
-                            _update_block_signals(layout, item, is_occupied=False)
-                        released_blocks.append(item)
+        for item in to_remove:
+            vrmapi.LOG(f"[route_leave] 列車名={t_name}, item={item}")
+            if item.startswith("進路構成-"):
+                # ポイント開放
+                opts = item.replace("進路構成-", "").split('>')
+                for pt_cmd in opts[:-1]:
+                    pt_name_sub = pt_cmd.replace("分岐", "").replace("直進", "")
+                    for p_name in list(POINT_TO_TRAIN.keys()):
+                        if pt_name_sub in p_name and train_id in POINT_TO_TRAIN[p_name]:
+                            POINT_TO_TRAIN[p_name].remove(train_id)
+                            if not POINT_TO_TRAIN[p_name]:
+                                del POINT_TO_TRAIN[p_name]
+                            released_points.append(p_name)
+            else:
+                # 閉塞開放
+                if item in BLOCK_TO_TRAIN and train_id in BLOCK_TO_TRAIN[item]:
+                    BLOCK_TO_TRAIN[item].remove(train_id)
+                    if not BLOCK_TO_TRAIN[item]:
+                        del BLOCK_TO_TRAIN[item]
+                        _update_block_signals(layout, item, is_occupied=False)
+                    released_blocks.append(item)
 
     # [ログ出力仕様準拠] 実際に開放された閉塞・ポイントをログ出力
     released_str = f"閉塞={released_blocks if released_blocks else None}, ポイント={released_points if released_points else None}"
@@ -333,7 +336,7 @@ def route_retry(layout):
             # 発車・再加速
             train_info = get_train_info(tr)
             vrmapi.LOG(f"  -> [進路再開] 待機中だった列車 {train_info['display_name']} の進路を構成し発車させます")
-            TRAIN_SMOOTH_MAP[t_id] = {'target': 1.0, 'current': tr.GetVoltage(), 'step': 0.1}
+            TRAIN_SMOOTH_MAP[t_id] = {'target': 1.0, 'current': tr.GetVoltage(), 'step': 0.01}
 
 def route_manage_by_coupling(master_id, target_id):
     """
@@ -439,14 +442,15 @@ def execute_train_command(layout):
             del TRAIN_COMMAND_QUEUE[train_id]
             continue
 
-        # 【重要】変速処理（自動加減速・補間タスク）が実行中の場合は、
-        # すべての列車制御コマンド（停止、反転、折返、分割、連結等）の実行を待機する
-        if train_id in TRAIN_SMOOTH_MAP:
-            continue
 
         # 先頭コマンドを参照（停止カウント中の場合は pop しない）
         cmd_info = cmd_list[0]
         cmd = cmd_info.get('cmd', '')
+
+        # 【重要】変速処理（自動加減速・補間タスク）が実行中の場合は、
+        # すべての変速以外の列車制御コマンド（停止、反転、折返、分割、連結等）の実行を待機する
+        if train_id in TRAIN_SMOOTH_MAP and not cmd.startswith("変速"):
+            continue
 
         if cmd.startswith("変速"):
             cmd_list.pop(0)
@@ -454,8 +458,10 @@ def execute_train_command(layout):
             speed = float(m.group(1)) / 100.0 if m and m.group(1) else 1.0
             dur = float(m.group(2)) if m and m.group(2) else 0.0
 
-            step_val = (speed - train_obj.GetVoltage()) / max(1, int(dur / SYSTEM_TIMER_INTERVAL)) if dur > 0 else (speed - train_obj.GetVoltage())
-            TRAIN_SMOOTH_MAP[train_id] = {'target': speed, 'current': train_obj.GetVoltage(), 'step': step_val}
+            current = train_obj.GetVoltage()
+            step_val = (speed - current) / max(1, int(dur / SYSTEM_TIMER_INTERVAL)) if dur > 0 else (speed - current)
+            TRAIN_SMOOTH_MAP[train_id] = {'target': speed, 'current': current, 'step': step_val}
+            vrmapi.LOG(f"[execute_train_command] 列車名={train_id}, 変速目標={speed}, 現在速度={current}, 時間={dur}, ステップ={step_val}")
 
         elif cmd.startswith("停止"):
             # 初回実行時に停止秒数を解析してカウントダウン用カウンターを設定
@@ -616,8 +622,7 @@ def pass_route_setting_head(layout, train_obj, train_id, train_info, route_optio
 
 def pass_route_setting_tail(layout, train_obj, train_id, train_info, route_option):
     """列車最後尾が進路構成センサーを通過完了した際の処理"""
-    pass_block_tail(layout, train_obj, train_id, train_info, route_option)
-
+    route_leave(layout, train_id, route_option, is_route_setting=True)
 
 def pass_backup_route(layout, train_obj, train_id, train_info, route_option):
     """本進路が塞がっていた場合に備え、予備進路を登録・通過処理する"""
@@ -636,7 +641,7 @@ def vrmevent(obj, ev, param):
     layout = vrmapi.LAYOUT()
 
     if ev == 'init':
-        vrmapi.LOG("[初期化] VNS 制御スクリプト Ver. 2.0 (詳細設計書準拠) 起動")
+        vrmapi.LOG("[初期化] VNS 制御スクリプト Ver. 1.2.1 起動")
 
         # 1. 信号機一覧を取得して初期化 (全青)
         global SIGNAL_LIST
