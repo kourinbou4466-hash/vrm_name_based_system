@@ -3,8 +3,8 @@ Train Control by Name
 I.MAGIC社製の[鉄道模型シミュレータNX](https://www.imagic.co.jp/hobby/)を自動制御するためのスクリプトです。
 
 # チュートリアル
-[基本的な自動化(列車制御・ポイント操作・閉塞)](https://www.youtube.com/watch?v=pZBEFF8kqvE)
-[進路構成(駅の出入り)](https://www.youtube.com/watch?v=GMfz0-ZrxdQ)
+- [基本的な自動化(列車制御・ポイント操作・閉塞)](https://www.youtube.com/watch?v=pZBEFF8kqvE)
+- [進路構成(駅の出入り)](https://www.youtube.com/watch?v=GMfz0-ZrxdQ)
 
 # スクリプト
 [レイアウトスクリプト](https://raw.githubusercontent.com/kourinbou4466-hash/vrm_name_based_system/refs/heads/main/src/layout_script.py)
